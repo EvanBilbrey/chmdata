@@ -15,32 +15,13 @@ from chmdata import mesonet
 sys.path.append("C:/Users/CND905/Downloaded_Programs/MTDNRCdata")
 import MTDNRCdata
 
-def get_gauge_locations(geometry: Union[Path, gpd.GeoDataFrame],
-                             dataset: str,
-                             status: str,
-                             site_type: str) -> gpd.GeoDataFrame:
+def get_gauge_locations(geometry: Union[Path, gpd.GeoDataFrame], plot=False) -> gpd.GeoDataFrame:
     """
-    Function to query USGS and DNRC stream gauge locations by type of site and available parameters using
-    polygon geometry
-    :param geometry: Path or geopandas.GeoDataFrame - polygon geometry of area that stations will be extracted from
-    :param dataset: str - desired variable to retrieve; specify 'QR' for discharge, 'HG' for stage, 'TW' for water
-     temperature, or 'Lake_Elev_NGVD' for reservoir elevation
-    :param status: str - desired status of gauge data record; specify 'Real-time', 'Seasonal', 'Discontinued', which
-     translate to 'P1W', 'P12W', 'P53W' for usgs gauge locations, respectively
-    :param site_type: str - type of site that gauge is located at: specify 'Stream' or 'Reservoir'
+    Function to query USGS and DNRC stream gauge locations using polygon geometry
+    :param geometry: Path or geopandas.GeoDataFrame - polygon geometry of area that stations will be extracted from in crs:4326
+    :param plot: bool - whether to plot station locations or not; default is False
     return: gpd.GeoDataFrame of gauge locations within the polygon area
     """
-
-    arg_dict = {
-        'dnrc':
-            {'status': ['Real-time', 'Seasonal', 'Discontinued'],
-             'site_type': ['Stream', 'Reservoir'],
-             'param': ['QR', 'HG', 'TW', 'Lake_Elev_NGVD']},
-        'usgs':
-            {'status': ['P1W', 'P12W', 'P53W'],
-             'site_type': ['ST', 'LK'],
-             'param': ['00060', '00065', '00010', '00065']}
-    }
 
     if geometry is not None:
         if isinstance(geometry, (str, Path)):
@@ -49,60 +30,42 @@ def get_gauge_locations(geometry: Union[Path, gpd.GeoDataFrame],
             in_geom = geometry
         else:
             raise ValueError("The input geometry is neither a string path nor a geopandas GeoDataFrame.")
-
-    # make reservoir a status argument for STAGE.get_site_location() function
-    if site_type == "Stream":
-        stat = status
-    if status in arg_dict['dnrc']['status'] and site_type == "Reservoir":
-        stat = site_type
+    if len(geometry) > 1:
+        raise ValueError("Only one geometry can be entered.")
 
     # get STAGE sites within geometry, site type and status
-    gdf = MTDNRCdata.stage.get_site_locations(geometry=in_geom, site_type=stat)
-
-    # filter results for parameter
-    ind_list = []
-    for i in range(len(gdf)):
-        site_df = MTDNRCdata.get_location_parameters(site_ids=gdf.iloc[i]['LocationCode'])
-        if dataset in list(site_df['Parameter'].values):
-            ind_list.append(i)
-    gdf = gdf.iloc[ind_list]
-
+    gdf = MTDNRCdata.stage.get_site_locations(geometry=in_geom)
     dnrc_gdf = gpd.GeoDataFrame(
         {'network': ['DNRC'] * len(gdf),
-         'id': gdf['LocationCode'].to_list(),
-         'name': gdf['LocationName'].to_list(),
-         'type': [site_type] * len(gdf),
-         'status': [stat] * len(gdf),
-         'geometry': gdf['geometry'].to_list()
-         }
-    )
+            'id': gdf['LocationCode'].to_list(),
+            'name': gdf['LocationName'].to_list(),
+            'type': gdf['StatusDesc'].to_list(),
+            'geometry': gdf['geometry'].to_list()
+            })
 
     # get USGS sites within bbox of geometry, parameter and status
     in_geom = in_geom.to_crs(4326)
     bnds = list(np.round(in_geom.bounds.values[0], decimals=6))
-    gdf = nwis.what_sites(
-        bBox=bnds,
-        parameterCd=arg_dict['usgs']['param'][arg_dict['dnrc']['param'].index(dataset)],
-        period=arg_dict['usgs']['status'][arg_dict['dnrc']['status'].index(status)])[0]
-    # filter results for site_type
-    gdf = gdf[gdf['site_tp_cd'] == arg_dict['usgs']['site_type'][arg_dict['dnrc']['site_type'].index(site_type)]]
-
+    gdf = nwis.what_sites(bBox=bnds)[0]
     usgs_gdf = gpd.GeoDataFrame(
         {'network': ['USGS'] * len(gdf),
-         'id': gdf['site_no'].to_list(),
-         'name': gdf['station_nm'].to_list(),
-         'type': [site_type] * len(gdf),
-         'status': [arg_dict['usgs']['status'][arg_dict['dnrc']['status'].index(status)]] * len(gdf),
-         'geometry': gdf['geometry'].to_list()
-         }
-    )
+            'id': gdf['site_no'].to_list(),
+            'name': gdf['station_nm'].to_list(),
+            'type': gdf['site_tp_cd'].to_list(),
+            'geometry': gdf['geometry'].to_list()
+            })
 
-    # concatenate dnrc and usgs results
+
     gdf = pd.concat([dnrc_gdf, usgs_gdf]).reset_index(drop=True)
 
     # filter gdf to sites intersecting with geometry
     gdf = gdf.set_crs(4326)
     out = gdf.loc[gdf.intersects(in_geom.geometry[0]), :].reset_index(drop=True)
+
+    if plot:
+        fig, ax = plt.subplots()
+        in_geom.boundary.plot(ax=ax, color='black')
+        gdf.plot(column='id', ax=ax, legend=True, cmap='Accent')
 
     return out
 

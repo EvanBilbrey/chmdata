@@ -7,6 +7,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from zeep import Client, helpers
 from typing import Union
+from datetime import datetime, timedelta
 
 import dataretrieval.nwis as nwis
 from chmdata import agrimet
@@ -14,6 +15,9 @@ from chmdata import mesonet
 
 sys.path.append("C:/Users/CND905/Downloaded_Programs/MTDNRCdata")
 import MTDNRCdata
+
+
+DEFAULT_DATES = ('1900-01-01', (datetime.today() - timedelta(days=2)).strftime("%Y-%m-%d"))
 
 def get_gauge_locations(geometry: Union[Path, gpd.GeoDataFrame], plot=False) -> gpd.GeoDataFrame:
     """
@@ -70,79 +74,117 @@ def get_gauge_locations(geometry: Union[Path, gpd.GeoDataFrame], plot=False) -> 
     return out
 
 
-def get_gauge_data(gdf: gpd.GeoDataFrame, dataset: str, timestep: str, start: str, end=str) -> xr.Dataset:
+def get_gauge_parameters(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Function to retrieve data from dnrc and usgs gauges
-    :param gdf: gpd.GeoDataFrame - dataframe of dnrc and usgs gauge sites with 'id' column of location codes and a
-    'network' of either 'DNRC' or 'USGS'
+    Function to add available parameters at DNRC and USGS gauge locations
+    :param gdf: geopandas.GeoDataFrame - gauge location information with parameters columns
+    return: gpd.GeoDataFrame of gauge locations information with available parameters
+    """
+    param_list = []
+    for i in range(len(gdf)):
+        site_id = gdf.iloc[i]['id']
+        if gdf.iloc[i]['network'] == "DNRC":
+            data = MTDNRCdata.stage.get_location_parameters(site_ids=site_id)
+            params = data['Parameter'].values.tolist()
+            param_list.append(list(set(params)))
+
+        if gdf.iloc[i]['network'] == "USGS":
+            data = nwis.get_record(sites=site_id)
+            params = [p[:5] for p in list(data)[1:]]
+            param_list.append(list(set(params)))
+
+    gdf['parameters'] = param_list
+
+    return gdf
+
+
+def get_stage_gauge_data(sites: Union[list, gpd.GeoDataFrame], dataset: str, timestep: str, start=DEFAULT_DATES[0], end=DEFAULT_DATES[1]) -> xr.Dataset:
+    """
+    Retrieve data from multiple DNRC stream gauges with xarray implementation
+    :param sites: gpd.GeoDataFrame or list - dnrc gauge sites with 'id' column of location codes to be retrieved
     :param dataset: str - data variable retrieved; specify 'QR' for discharge, 'HG' for stage, or 'TW' for water temperature
     :param timestep: str - frequency of data retrieved; specify either 'instant' for instantaneous data or 'daily' for
      average daily values
-    :param start: str - start date of period of interest, in YYYY-MM-DD format
-    :param end: str - end date of period of interest, in YYYY-MM-DD format
-    return: xr.Dataset of data from requested gauge locations
+    :param start: str - start date of period of interest, in YYYY-MM-DD format; defult is 1900-01-01
+    :param end: str - end date of period of interest, in YYYY-MM-DD format; defult is the prior days date
+    return: xr.Dataset of data requested from gauge locations
     """
-
-    arg_dict = {
-        'dnrc':
-            {'param': ['QR', 'HG', 'TW'],
-             'timestep': ['instant', 'daily'],
-             'variable': ['discharge', 'stage', 'water_temperature']},
-        'usgs':
-            {'param': ['00060', '00065', '00010'],
-             'units': ['ft^3/s', 'ft', 'degC'],
-             'timestep': ['iv', 'dv'],
-             'timestep_ind': ['', '_Mean']}
-    }
+    if sites is not None:
+        if isinstance(sites, gpd.GeoDataFrame):
+            in_sites = list(sites['id'])
+        elif isinstance(sites, list):
+            in_sites = sites
+        else:
+            raise ValueError("The sites input is neither a geopandas GeoDataFrame nor a list.")
 
     xda_list = []
-    for i in range(len(gdf)):
-        site_id = gdf.iloc[i]['id']
+    for i in range(len(in_sites)):
+        site_id = in_sites[i]
 
-        if gdf.iloc[i]['network'] == "DNRC":
-            data = MTDNRCdata.stage.GetSite(site_id, timestep=timestep, dataset=dataset, start=start, end=end)
-            data = data.data
-            xda = xr.DataArray(
-                data=np.array([data['RecordedValue'].values]).transpose(),
-                dims=['time', 'location'],
-                coords=dict(
-                    time=(['time'], np.array(pd.to_datetime(data.index, utc=True))),
-                    location=(['location'], [data.iloc[0]['SiteID']])
-                ),
-                attrs=dict(
-                    description=data['DatasetLabel'].values[0][:data['DatasetLabel'].values[0].rfind('(')],
-                    units=data['DatasetLabel'].values[0][data['DatasetLabel'].values[0].rfind('_') + 1:]
-                ),
-                name=dataset
-            )
-            xda_list.append(xda)
+        data = MTDNRCdata.stage.GetSite(site_id, timestep=timestep, dataset=dataset, start=start, end=end)
+        data = data.data
 
-        if gdf.iloc[i]['network'] == "USGS":
-            data = nwis.get_record(sites=site_id,
-                                   service=arg_dict['usgs']['timestep'][arg_dict['dnrc']['timestep'].index(timestep)],
-                                   start=start,
-                                   end=end,
-                                   parameterCd=arg_dict['usgs']['param'][arg_dict['dnrc']['param'].index(dataset)])
-            xda = xr.DataArray(
-                data=np.array([data[arg_dict['usgs']['param'][arg_dict['dnrc']['param'].index(dataset)] +
-                                    arg_dict['usgs']['timestep_ind'][
-                                        arg_dict['dnrc']['timestep'].index(timestep)]].values]).transpose(),
-                dims=['time', 'location'],
-                coords=dict(
-                    time=(['time'], np.array(pd.to_datetime(data.index, utc=True))),
-                    location=(['location'], [data.iloc[0]['site_no']])
-                ),
-                attrs=dict(
-                    description=arg_dict['usgs']['param'][arg_dict['dnrc']['param'].index(dataset)] +
-                                arg_dict['usgs']['timestep_ind'][arg_dict['dnrc']['timestep'].index(timestep)],
-                    units=arg_dict['usgs']['units'][arg_dict['dnrc']['param'].index(dataset)]
-                ),
-                name=dataset
-            )
+        xda = xr.DataArray(
+            data=np.array([data['RecordedValue'].values]).transpose(),
+            dims=['time', 'location'],
+            coords=dict(
+                time=(['time'], np.array(pd.to_datetime(data.index, utc=True))),
+                location=(['location'], [data.iloc[0]['SiteID']])
+            ),
+            attrs=dict(
+                description=data['DatasetLabel'].values[0][:data['DatasetLabel'].values[0].rfind('(')],
+                units=data['DatasetLabel'].values[0][data['DatasetLabel'].values[0].rfind('_') + 1:]
+            ),
+            name=dataset
+        )
 
-            xda_list.append(xda)
+        xda_list.append(xda)
+    output = xr.merge(xda_list)
 
-        output = xr.merge(xda_list)
+    return output
+
+
+def get_usgs_gauge_data(sites: Union[list, gpd.GeoDataFrame], dataset: str, timestep: str, start=DEFAULT_DATES[0],
+                        end=DEFAULT_DATES[1]) -> xr.Dataset:
+    """
+    Retrieve data from multiple USGS stream gauges with xarray implementation
+    :param sites: gpd.GeoDataFrame or list - usgs gauge sites with 'id' column of location codes to be retrieved
+    :param dataset: str - data variable retrieved
+    :param timestep: str - frequency of data retrieved; specify either 'iv' for instantaneous data or 'dv' for
+     average daily values
+    :param start: str - start date of period of interest, in YYYY-MM-DD format; defult is 1900-01-01
+    :param end: str - end date of period of interest, in YYYY-MM-DD format; defult is the prior days date
+    return: xr.Dataset of data requested from gauge locations
+    """
+
+    if sites is not None:
+        if isinstance(sites, gpd.GeoDataFrame):
+            in_sites = list(sites['id'])
+        elif isinstance(sites, list):
+            in_sites = sites
+        else:
+            raise ValueError("The sites input is neither a geopandas GeoDataFrame nor a list.")
+
+    xda_list = []
+    for i in range(len(in_sites)):
+        site_id = in_sites[i]
+
+        data = nwis.get_record(sites=site_id, service=timestep, start=start, end=end, parameterCd=dataset)
+
+        if len(data) == 0:
+            continue
+
+        xda = xr.DataArray(
+            data=np.array(np.array([data.iloc[:, 1]])).transpose(),
+            dims=['time', 'location'],
+            coords=dict(
+                time=(['time'], np.array(pd.to_datetime(data.index, utc=True))),
+                location=(['location'], [data.iloc[0]['site_no']])),
+            name=data.columns[1]
+        )
+
+        xda_list.append(xda)
+    output = xr.merge(xda_list)
 
     return output
 
